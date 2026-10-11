@@ -30,7 +30,7 @@ position. It shows what the camera sees and has:
 Requires Python 3, a webcam, and `curl`.
 
 ```sh
-git clone https://github.com/<you>/hand-gestures.git
+git clone https://github.com/K-P-D-7/hand-gestures.git
 cd hand-gestures
 ./install.sh
 ```
