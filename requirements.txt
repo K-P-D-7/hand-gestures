@@ -1,0 +1,4 @@
+mediapipe
+opencv-contrib-python-headless
+PyQt6
+evdev
