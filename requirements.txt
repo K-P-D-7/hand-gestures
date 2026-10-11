@@ -1,4 +1,4 @@
 mediapipe
 opencv-contrib-python-headless
 PyQt6
-evdev
+evdev; sys_platform == "linux"

@@ -1,8 +1,8 @@
 # Hand Gestures
 
-Control your Linux desktop with hand gestures through your webcam: scroll pages and
-switch tabs without touching the mouse. Works on **Wayland** (tested on CachyOS / KDE
-Plasma) and X11, because input is sent through `/dev/uinput`.
+Control your computer with hand gestures through your webcam: scroll pages and
+switch tabs without touching the mouse. Runs on **Linux** (Wayland and X11, tested on
+CachyOS / KDE Plasma) and **Windows 10/11**.
 
 ## Gestures
 
@@ -25,7 +25,7 @@ position. It shows what the camera sees and has:
 - Scroll speed, pause length, reverse scroll direction
 - Optional camera preview with the tracked hand points
 
-## Install
+## Install on Linux
 
 Requires Python 3, a webcam, and `curl`.
 
@@ -40,14 +40,26 @@ a udev rule so your session can use `/dev/uinput` (asks for sudo), and adds
 **Hand Gestures** to your app menu. Log out and back in if it reports no permission
 for `/dev/uinput`.
 
-## Run
-
 Launch **Hand Gestures** from the app menu, or:
 
 ```sh
 ./run.sh              # default camera
 ./run.sh --camera 2   # pick another camera
 ```
+
+## Install on Windows
+
+1. Install [Python 3](https://www.python.org/downloads/) and tick
+   **Add python.exe to PATH** in the installer.
+2. Download this repo (**Code → Download ZIP**, then extract it) or `git clone` it.
+3. Double-click **`install.bat`**.
+
+The installer sets up a virtual environment, downloads the hand model, and adds
+**Hand Gestures** shortcuts to the Start menu and desktop. You can also start it with
+`run.bat` (for another camera: `run.bat --camera 1`).
+
+On Windows, Alt+Tab mode can't switch to apps running as administrator unless Hand
+Gestures also runs as administrator (a Windows security rule).
 
 ## Tuning
 

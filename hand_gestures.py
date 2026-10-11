@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hand-gesture control for Linux (Wayland/X11) using a webcam.
+"""Hand-gesture control for Linux (Wayland/X11) and Windows using a webcam.
 
 Gestures
   * 2 fingers (index + middle) up, move hand up/down  -> scroll
@@ -7,10 +7,10 @@ Gestures
     (Ctrl+Shift+Tab / Ctrl+Tab, or Alt+Shift+Tab / Alt+Tab in "Windows" mode)
   * Open + close all 5 fingers twice                   -> stop / resume gestures
 
-Input is injected through /dev/uinput, so it works on KDE Wayland.
+On Linux input is injected through /dev/uinput, so it works on KDE Wayland.
+On Windows it uses SendInput.
 """
 import argparse
-import os
 import sys
 import time
 from collections import deque
@@ -18,7 +18,6 @@ from pathlib import Path
 
 import cv2
 import mediapipe as mp
-from evdev import UInput, ecodes as e
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python import vision
 from PyQt6.QtCore import QSettings, QThread, Qt, pyqtSignal, QPoint
@@ -45,8 +44,12 @@ TOGGLE_WINDOW = 2.5           # seconds to complete open-close-open-close
 
 
 # --- input injection ------------------------------------------------------
-class Injector:
+class LinuxInjector:
     def __init__(self):
+        from evdev import UInput, ecodes as e
+        self.e = e
+        self.keys = {"ctrl": e.KEY_LEFTCTRL, "shift": e.KEY_LEFTSHIFT,
+                     "alt": e.KEY_LEFTALT, "tab": e.KEY_TAB}
         self.kbd = UInput({e.EV_KEY: list(range(1, 249))}, name="hand-gestures-kbd")
         self.mouse = UInput({
             e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
@@ -57,6 +60,7 @@ class Injector:
 
     def scroll(self, hires_units):
         """Scroll by hi-res wheel units (120 = one notch). Positive = up."""
+        e = self.e
         self._hires_acc += hires_units
         hires = int(self._hires_acc)
         if hires == 0:
@@ -71,19 +75,85 @@ class Injector:
             self.mouse.write(e.EV_REL, e.REL_WHEEL, notches)
         self.mouse.syn()
 
-    def combo(self, *keys):
+    def combo(self, *names):
+        """Press and release a key combination, e.g. combo("ctrl", "tab")."""
+        keys = [self.keys[n] for n in names]
         for k in keys:
-            self.kbd.write(e.EV_KEY, k, 1)
+            self.kbd.write(self.e.EV_KEY, k, 1)
             self.kbd.syn()
             time.sleep(0.01)
         for k in reversed(keys):
-            self.kbd.write(e.EV_KEY, k, 0)
+            self.kbd.write(self.e.EV_KEY, k, 0)
             self.kbd.syn()
             time.sleep(0.01)
 
     def close(self):
         self.kbd.close()
         self.mouse.close()
+
+
+class WindowsInjector:
+    """Same interface as LinuxInjector, using the Win32 SendInput API."""
+
+    def __init__(self):
+        import ctypes
+        self.ct = ctypes
+
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [("dx", ctypes.c_int32), ("dy", ctypes.c_int32),
+                        ("mouseData", ctypes.c_uint32), ("dwFlags", ctypes.c_uint32),
+                        ("time", ctypes.c_uint32), ("dwExtraInfo", ctypes.c_size_t)]
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [("wVk", ctypes.c_uint16), ("wScan", ctypes.c_uint16),
+                        ("dwFlags", ctypes.c_uint32), ("time", ctypes.c_uint32),
+                        ("dwExtraInfo", ctypes.c_size_t)]
+
+        class _U(ctypes.Union):
+            _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT)]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [("type", ctypes.c_uint32), ("u", _U)]
+
+        self.INPUT, self.MOUSEINPUT, self.KEYBDINPUT = INPUT, MOUSEINPUT, KEYBDINPUT
+        self.keys = {"ctrl": 0x11, "shift": 0x10, "alt": 0x12, "tab": 0x09}
+        self._acc = 0.0
+
+    def _send(self, inp):
+        self.ct.windll.user32.SendInput(1, self.ct.byref(inp), self.ct.sizeof(self.INPUT))
+
+    def scroll(self, hires_units):
+        """Scroll by wheel units (120 = one notch). Positive = up."""
+        self._acc += hires_units
+        delta = int(self._acc)
+        if delta == 0:
+            return
+        self._acc -= delta
+        MOUSEEVENTF_WHEEL = 0x0800
+        inp = self.INPUT(type=0)  # INPUT_MOUSE
+        inp.u.mi = self.MOUSEINPUT(0, 0, delta & 0xFFFFFFFF, MOUSEEVENTF_WHEEL, 0, 0)
+        self._send(inp)
+
+    def _key(self, vk, up):
+        inp = self.INPUT(type=1)  # INPUT_KEYBOARD
+        inp.u.ki = self.KEYBDINPUT(vk, 0, 0x0002 if up else 0, 0, 0)  # KEYEVENTF_KEYUP
+        self._send(inp)
+
+    def combo(self, *names):
+        keys = [self.keys[n] for n in names]
+        for k in keys:
+            self._key(k, False)
+            time.sleep(0.01)
+        for k in reversed(keys):
+            self._key(k, True)
+            time.sleep(0.01)
+
+    def close(self):
+        pass
+
+
+IS_WINDOWS = sys.platform == "win32"
+Injector = WindowsInjector if IS_WINDOWS else LinuxInjector
 
 
 # --- hand pose classification ---------------------------------------------
@@ -220,7 +290,7 @@ class GestureWorker(QThread):
             self.event.emit("Paused" if value else "Resumed")
 
     def run(self):
-        cap = cv2.VideoCapture(self.camera, cv2.CAP_V4L2)
+        cap = cv2.VideoCapture(self.camera, cv2.CAP_DSHOW if IS_WINDOWS else cv2.CAP_V4L2)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         if not cap.isOpened():
@@ -321,11 +391,11 @@ class GestureWorker(QThread):
         landmarker.close()
 
     def _switch(self, right):
-        mod = e.KEY_LEFTALT if self.mode == "windows" else e.KEY_LEFTCTRL
+        mod = "alt" if self.mode == "windows" else "ctrl"
         if right:
-            self.inj.combo(mod, e.KEY_TAB)
+            self.inj.combo(mod, "tab")
         else:
-            self.inj.combo(mod, e.KEY_LEFTSHIFT, e.KEY_TAB)
+            self.inj.combo(mod, "shift", "tab")
         what = "window" if self.mode == "windows" else "tab"
         self.event.emit(f"{'Next' if right else 'Previous'} {what} {'→' if right else '←'}")
 
