@@ -10,12 +10,17 @@ CachyOS / KDE Plasma) and **Windows 10/11**.
 |---|---|
 | ✌️ Index + middle finger up, wave up / down | Scroll. Bigger waves scroll more; small finger flicks scroll a little |
 | 🤟 Index + middle + ring finger up, swipe right / left | Next / previous tab (Ctrl+Tab), or window (Alt+Tab) |
-| 👌 Pinch index finger and thumb together once | Stop / resume gestures |
+| 👌 Pinch index finger and thumb together once | Play / pause videos and music (media ⏯ key) |
 | 🖐️✊🖐️✊ Open and close all five fingers twice | Stop / resume gestures |
 | Flash four fingers (thumb tucked in) twice | Minimize to the bubble, or expand it back |
 
-When you scroll, bringing your hand back to where it started does not scroll the page
-back. To scroll the other way, hold still for a moment (the **Pause** setting) first.
+Scrolling follows how you naturally flick: the flick is fast and bringing your hand
+back is slower, so only the flick scrolls. Once you've scrolled one way, keep flicking
+that way; moving back never scrolls. To scroll the other way, rest for a moment (the
+**Return lock** setting) or flick clearly faster than before. Bigger waves scroll more
+than small finger flicks.
+
+Good lighting matters: in a dim room webcams blur fast movements and lose the hand.
 
 ## Control window
 
@@ -26,7 +31,7 @@ position. It shows what the camera sees and has:
 - **–** button minimizes it to a small round bubble (green ring = active, amber = paused).
   Click the bubble or flash four fingers twice to expand it again; drag it to move it
 - Swipe mode: browser tabs (Ctrl+Tab) or windows (Alt+Tab)
-- Scroll speed, pause length, reverse scroll direction
+- Scroll speed, return lock, reverse scroll direction
 - Optional camera preview with the tracked hand points
 
 ## Install on Linux

@@ -6,13 +6,15 @@ Gestures
   * 3 fingers (index + middle + ring) swipe left/right -> previous / next tab
     (Ctrl+Shift+Tab / Ctrl+Tab, or Alt+Shift+Tab / Alt+Tab in "Windows" mode)
   * Open + close all 5 fingers twice                   -> stop / resume gestures
-  * Pinch index finger and thumb together once         -> stop / resume gestures
+  * Pinch index finger and thumb together once         -> play / pause media (videos, music)
   * Flash 4 fingers (thumb tucked) twice               -> minimize / expand the window
 
 On Linux input is injected through /dev/uinput, so it works on KDE Wayland.
 On Windows it uses SendInput.
 """
 import argparse
+import math
+import subprocess
 import sys
 import time
 from collections import deque
@@ -32,13 +34,21 @@ MODEL = HERE / "hand_landmarker.task"
 
 # --- tuning ---------------------------------------------------------------
 POSE_STABLE_FRAMES = 3        # frames a pose must persist before it counts
-SCROLL_COMMIT = 0.03          # fraction of frame height before a movement counts as a stroke
-SCROLL_REVERSE = 0.02         # backwards travel that ends a stroke
+# Scroll speeds are in frame heights per second, measured on a real hand at 30 fps:
+# flicks peaked at 0.3-3.2/s and were always faster than the return that followed.
+SCROLL_COMMIT = 0.02          # fraction of frame height before a movement can scroll
+SCROLL_REVERSE = 0.015        # backwards travel that ends a movement
 SCROLL_ACCEL = 4.0            # bigger strokes scroll proportionally more (1 + ACCEL * stroke size)
-SCROLL_SMOOTH = 0.5           # EMA factor for fingertip position
+SCROLL_SMOOTH_TAU = 0.04      # seconds; fingertip position smoothing time constant
+FLICK_MIN_SPEED = 0.25        # slower movements never scroll (drift, slow returns)
+FIRST_FLICK_SPEED = 0.6       # with no scroll direction yet, a flick this fast scrolls
+FIRST_FLICK_RATIO = 1.3       # ...or one this many times faster than the movement before it
+REVERSE_RATIO = 1.2           # scrolling the other way needs this many times the last flick's speed
 STILL_RANGE = 0.015           # movement range (frame height) that still counts as "still"
 STILL_WINDOW = 0.2            # seconds used to judge stillness
-SCROLL_STICKY = 0.5           # keep scrolling this long (s) if the 2-finger pose flickers
+SETTLE_TIME = 0.1             # hand must be still this long (s) before the first scroll
+SCROLL_HOLD = 1.5             # keep following the fingertips this long (s) after 2 fingers were last seen
+HAND_LOST_RESET = 0.6         # forget the scroll stroke if the hand is missing this long (s)
 SWIPE_WINDOW = 0.45           # seconds of history used to detect a swipe
 SWIPE_DISTANCE = 0.16         # fraction of frame width hand must travel
 SWIPE_COOLDOWN = 0.8          # seconds between tab switches
@@ -46,6 +56,8 @@ TOGGLE_WINDOW = 2.5           # seconds to complete open-close-open-close (or 4-
 THUMB_TUCKED = 0.65           # thumb tip within this many palm sizes of the palm centre = tucked
 PINCH_DISTANCE = 0.25         # thumb-index tip gap (fraction of palm size) that counts as a pinch
 PINCH_COOLDOWN = 0.6          # seconds before another pinch can toggle again
+TWO_FINGER_UP = 1.0           # index/middle tip-to-wrist vs knuckle-to-wrist ratio for "two"
+                              # (looser than 1.1: they bend a little while flicking)
 
 
 # --- input injection ------------------------------------------------------
@@ -54,7 +66,8 @@ class LinuxInjector:
         from evdev import UInput, ecodes as e
         self.e = e
         self.keys = {"ctrl": e.KEY_LEFTCTRL, "shift": e.KEY_LEFTSHIFT,
-                     "alt": e.KEY_LEFTALT, "tab": e.KEY_TAB}
+                     "alt": e.KEY_LEFTALT, "tab": e.KEY_TAB,
+                     "playpause": e.KEY_PLAYPAUSE}
         self.kbd = UInput({e.EV_KEY: list(range(1, 249))}, name="hand-gestures-kbd")
         self.mouse = UInput({
             e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
@@ -121,7 +134,8 @@ class WindowsInjector:
             _fields_ = [("type", ctypes.c_uint32), ("u", _U)]
 
         self.INPUT, self.MOUSEINPUT, self.KEYBDINPUT = INPUT, MOUSEINPUT, KEYBDINPUT
-        self.keys = {"ctrl": 0x11, "shift": 0x10, "alt": 0x12, "tab": 0x09}
+        self.keys = {"ctrl": 0x11, "shift": 0x10, "alt": 0x12, "tab": 0x09,
+                     "playpause": 0xB3}  # VK_MEDIA_PLAY_PAUSE
         self._acc = 0.0
 
     def _send(self, inp):
@@ -197,87 +211,118 @@ def classify(lm):
         return "fist"
     if i and m and r and not p:
         return "three"
-    if i and m and not r and not p:
+    # two: index + middle up, ring folded. The pinky is ignored: a loosely curled
+    # pinky measured as "up" in about half the frames of a real scrolling hand.
+    wrist = lm[0]
+    straight = lambda tip, pip: _d(lm[tip], wrist) > _d(lm[pip], wrist) * TWO_FINGER_UP
+    if straight(8, 6) and straight(12, 10) and not r:
         return "two"
     return "other"
 
 
 # --- scroll stroke tracking ------------------------------------------------
 class ScrollTracker:
-    """Turns fingertip height into scroll amounts, one stroke at a time.
+    """Turns fingertip height into scroll amounts.
 
-    A stroke starts once the hand travels SCROLL_COMMIT in one direction (so a small
-    wind-up doesn't set the direction) and ends when the hand reverses. The stroke
-    right after a scroll stroke is the hand returning and is ignored. Holding still
-    for `pause` seconds re-arms, so the next stroke scrolls in either direction.
+    The hand's path is split into movements at each reversal. Flicks are faster than
+    the return that follows them, so speed decides which movements scroll:
+      * with no scroll direction yet, a movement scrolls if it is a clear flick
+        (FIRST_FLICK_SPEED, or FIRST_FLICK_RATIO x faster than the movement before);
+      * after that, movements in the same direction scroll if they beat
+        FLICK_MIN_SPEED, and movements the other way are returns that never scroll,
+        unless they are REVERSE_RATIO x faster than the last scrolling flick;
+      * resting for `pause` seconds forgets the direction.
+    Nothing scrolls until the hand has been still once after the tracker starts, so
+    raising the hand into position (or joining mid-wave) doesn't scroll.
+    A scrolling movement scrolls its whole length, accelerated by its size.
     """
 
     def __init__(self):
-        self.pause = 0.5
+        self.pause = 1.5
         self.reset()
 
     def reset(self):
         self.pos = None
-        self.dir = 0                  # +1 up / -1 down while in a stroke
-        self.role = None              # "scroll" or "return"
+        self.t = None
+        self.dir = 0                  # direction of the current movement, +1 up / -1 down
         self.start = self.extreme = 0.0
-        self.lo = self.hi = 0.0
-        self.expect_return = False
+        self.peak = 0.0               # peak speed of the current movement
+        self.scrolling = False        # current movement has qualified as a scroll
+        self.scrolled_to = 0.0        # position up to which it has scrolled
+        self.prev_peak = 0.0          # peak speed of the previous movement
+        self.pref = 0                 # scroll direction learned from the last flick
+        self.pref_peak = 0.0          # that flick's peak speed
         self.hist = deque()
         self.still_since = None
+        self.settled = False          # hand has been still since the tracker started
+        self.move_settled = False     # current movement began after settling
 
     def update(self, t, y):
         """y: normalized fingertip height (0 = top). Returns scroll in frame heights, + = up."""
         up = -y
-        self.pos = up if self.pos is None else SCROLL_SMOOTH * self.pos + (1 - SCROLL_SMOOTH) * up
+        if self.pos is None:
+            self.pos = self.start = self.extreme = up
+            self.t = t
+            return 0.0
+        dt = max(t - self.t, 1e-3)
+        prev = self.pos
+        self.pos += (1 - math.exp(-dt / SCROLL_SMOOTH_TAU)) * (up - self.pos)
+        self.t = t
         p = self.pos
+        speed = abs(p - prev) / dt
+
         self.hist.append((t, p))
         while self.hist and t - self.hist[0][0] > STILL_WINDOW:
             self.hist.popleft()
         vals = [v for _, v in self.hist]
         if max(vals) - min(vals) < STILL_RANGE:
             self.still_since = self.still_since or t
+            if t - self.still_since >= SETTLE_TIME:
+                self.settled = True
+            if t - self.still_since >= self.pause:
+                self.pref = 0
         else:
             self.still_since = None
-        rested = self.still_since is not None and t - self.still_since >= self.pause
 
-        if self.dir == 0:
-            if rested or not self.expect_return and self.still_since is not None:
-                self.lo = self.hi = p   # forget drift while resting
-                if rested:
-                    self.expect_return = False
-            self.lo, self.hi = min(self.lo, p), max(self.hi, p)
-            if p - self.lo > SCROLL_COMMIT:
-                return self._begin(+1, self.lo, p)
-            if self.hi - p > SCROLL_COMMIT:
-                return self._begin(-1, self.hi, p)
+        if self.dir == 0:             # waiting for the first movement
+            if abs(p - self.start) > SCROLL_REVERSE:
+                self.dir = 1 if p > self.start else -1
+                self.extreme, self.peak = p, speed
+                self.move_settled = self.settled
             return 0.0
+        if (p - self.extreme) * self.dir >= 0:      # still moving the same way
+            self.extreme = p
+            if (p - prev) * self.dir > 0:
+                self.peak = max(self.peak, speed)
+        elif (self.extreme - p) * self.dir > SCROLL_REVERSE:   # reversed: new movement
+            self.prev_peak = self.peak
+            self.dir, self.start, self.extreme = -self.dir, self.extreme, p
+            self.peak, self.scrolling = speed, False
+            self.move_settled = self.settled
 
-        if rested:                    # paused mid-stroke: stroke is over, re-armed
-            self.dir, self.expect_return = 0, False
-            self.lo = self.hi = p
-            return 0.0
-        if (p - self.extreme) * self.dir > 0:
-            return self._extend(p)
-        if (self.extreme - p) * self.dir > SCROLL_REVERSE:
-            # reversed: a scroll stroke is followed by an ignored return stroke
-            nxt = "return" if self.role == "scroll" else "scroll"
-            self.dir, self.start, self.role = -self.dir, self.extreme, nxt
-            return self._extend(p)
+        if not self.scrolling and self._qualifies(p):
+            self.scrolling, self.scrolled_to = True, self.start
+            self.pref = self.dir
+        if self.scrolling:
+            self.pref_peak = max(self.pref_peak, self.peak) if self.pref == self.dir else self.peak
+            if (p - self.scrolled_to) * self.dir > 0:
+                delta = p - self.scrolled_to
+                self.scrolled_to = p
+                return delta * (1 + SCROLL_ACCEL * abs(p - self.start))
         return 0.0
 
-    def _begin(self, d, start, p):
-        self.dir, self.start, self.extreme = d, start, start
-        self.role = "return" if self.expect_return else "scroll"
-        self.expect_return = False
-        return self._extend(p)
-
-    def _extend(self, p):
-        delta = p - self.extreme
-        self.extreme = p
-        if self.role != "scroll":
-            return 0.0
-        return delta * (1 + SCROLL_ACCEL * abs(p - self.start))
+    def _qualifies(self, p):
+        if (not self.move_settled or abs(p - self.start) < SCROLL_COMMIT
+                or self.peak < FLICK_MIN_SPEED):
+            return False
+        if self.pref == self.dir:
+            return True
+        if self.pref == -self.dir:
+            return self.peak > REVERSE_RATIO * self.pref_peak
+        # no direction yet: a clear flick, or clearly faster than the movement before
+        # (the very first movement has nothing to compare with)
+        return (self.peak > FIRST_FLICK_SPEED
+                or self.prev_peak > 0 and self.peak > FIRST_FLICK_RATIO * self.prev_peak)
 
 
 # --- worker thread ----------------------------------------------------------
@@ -310,6 +355,15 @@ class GestureWorker(QThread):
         cap = cv2.VideoCapture(self.camera, cv2.CAP_DSHOW if IS_WINDOWS else cv2.CAP_V4L2)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        if not IS_WINDOWS:
+            # Many webcams drop to ~10 fps in dim light when this is on; fast flicks
+            # then last only 1-2 frames. Darker image at 30 fps tracks much better.
+            try:
+                subprocess.run(["v4l2-ctl", "-d", f"/dev/video{self.camera}",
+                                "-c", "exposure_dynamic_framerate=0"],
+                               capture_output=True, timeout=3)
+            except (OSError, subprocess.SubprocessError):
+                pass
         if not cap.isOpened():
             self.status.emit(f"Cannot open camera {self.camera}")
             return
@@ -324,7 +378,9 @@ class GestureWorker(QThread):
             ))
 
         raw_pose, raw_count, pose = None, 0, None
-        last_two = -1.0               # last time the 2-finger pose was seen
+        last_two = -1e9               # last time the 2-finger pose was seen
+        last_hand = -1e9
+        pinch_armed = True
         swipe_hist = deque()
         last_swipe = 0.0
         toggle_events = deque()       # times of open->fist transitions
@@ -348,30 +404,51 @@ class GestureWorker(QThread):
 
             if not res.hand_landmarks:
                 raw_pose, raw_count, pose = None, 0, None
-                self.scroll.reset()
+                if now - last_hand > HAND_LOST_RESET:
+                    self.scroll.reset()
                 swipe_hist.clear()
                 self.status.emit("Paused · no hand" if self.paused else "No hand")
                 self._emit_preview(rgb, None)
                 continue
 
             lm = res.hand_landmarks[0]
+            last_hand = now
             p = classify(lm)
             raw_count = raw_count + 1 if p == raw_pose else 1
             raw_pose = p
             if raw_count >= POSE_STABLE_FRAMES:
                 pose = p
 
-            # --- stop/resume: open-close twice -----------------------------
-            if pose != prev_pose:
+            # Scroll mode: entered with a steady 2-finger pose, then the fingertips are
+            # followed whatever the pose reads mid-motion (bent fingers look like a fist or
+            # a pinch), until 2 fingers haven't been seen for SCROLL_HOLD or 3/4 fingers show.
+            if pose == "two" or (p == "two" and now - last_two < SCROLL_HOLD):
+                last_two = now
+            if pose in ("three", "four"):
+                last_two = -1e9
+            scrolling = not self.paused and now - last_two < SCROLL_HOLD
+
+            # --- pause / window gestures (ignored while scrolling) ----------
+            if pose != "pinch":
+                pinch_armed = True
+            if scrolling:
+                toggle_events.clear()
+                four_events.clear()
+                prev_pose = pose
+            elif pose != prev_pose:
                 if prev_pose == "open" and pose == "fist":
                     toggle_events.append(now)
                 if pose == "four":
                     four_events.append(now)
-                # --- stop/resume: pinch once ------------------------------
-                if pose == "pinch" and now - last_pinch > PINCH_COOLDOWN:
-                    last_pinch = now
-                    self.set_paused(not self.paused)
                 prev_pose = pose
+            # --- play/pause media: pinch once ---------------------------
+            if (not scrolling and not self.paused and pose == "pinch" and pinch_armed
+                    and now - last_pinch > PINCH_COOLDOWN):
+                pinch_armed = False
+                last_pinch = now
+                self.inj.combo("playpause")
+                self.event.emit("Play / Pause ⏯")
+            # --- stop/resume: open-close twice ----------------------------
             while toggle_events and now - toggle_events[0] > TOGGLE_WINDOW:
                 toggle_events.popleft()
             if len(toggle_events) >= 2:
@@ -393,10 +470,7 @@ class GestureWorker(QThread):
                 continue
 
             # --- scroll: two fingers --------------------------------------
-            # Brief flickers to fist/other (e.g. bending the fingers) keep scrolling.
-            if pose == "two" or (pose in ("fist", "other") and now - last_two < SCROLL_STICKY):
-                if pose == "two":
-                    last_two = now
+            if scrolling:
                 amount = self.scroll.update(now, (lm[8].y + lm[12].y) / 2)
                 if amount:
                     if self.reverse_scroll:
@@ -584,7 +658,8 @@ class ControlWindow(QWidget):
         self.pause_label = QLabel()
         pause_row.addWidget(self.pause_label)
         self.pause = QSlider(Qt.Orientation.Horizontal)
-        self.pause.setRange(0, 20)    # tenths of a second
+        self.pause.setRange(5, 40)    # tenths of a second
+        self.pause.setToolTip("How long to rest before you can scroll back the other way")
         self.pause.valueChanged.connect(self._pause_changed)
         pause_row.addWidget(self.pause)
         lay.addLayout(pause_row)
@@ -612,7 +687,7 @@ class ControlWindow(QWidget):
         s = self.settings
         self.mode.setCurrentIndex(int(s.value("mode", 0)))
         self.speed.setValue(int(s.value("speed", 6000)))
-        self.pause.setValue(int(s.value("pause", 5)))
+        self.pause.setValue(int(s.value("return_lock", 15)))
         self._pause_changed(self.pause.value())
         self.reverse.setChecked(s.value("reverse", "false") == "true")
         self.preview_cb.setChecked(s.value("preview", "false") == "true")
@@ -634,8 +709,8 @@ class ControlWindow(QWidget):
 
     def _pause_changed(self, v):
         self.worker.scroll.pause = v / 10
-        self.pause_label.setText(f"Pause {v / 10:.1f}s")
-        self.settings.setValue("pause", v)
+        self.pause_label.setText(f"Return lock {v / 10:.1f}s")
+        self.settings.setValue("return_lock", v)
 
     def _reverse_changed(self, v):
         self.worker.reverse_scroll = v
