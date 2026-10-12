@@ -10,7 +10,9 @@ CachyOS / KDE Plasma) and **Windows 10/11**.
 |---|---|
 | ✌️ Index + middle finger up, wave up / down | Scroll. Bigger waves scroll more; small finger flicks scroll a little |
 | 🤟 Index + middle + ring finger up, swipe right / left | Next / previous tab (Ctrl+Tab), or window (Alt+Tab) |
+| 👌 Pinch index finger and thumb together once | Stop / resume gestures |
 | 🖐️✊🖐️✊ Open and close all five fingers twice | Stop / resume gestures |
+| Flash four fingers (thumb tucked in) twice | Expand the minimized bubble back to the full window |
 
 When you scroll, bringing your hand back to where it started does not scroll the page
 back. To scroll the other way, hold still for a moment (the **Pause** setting) first.
@@ -21,6 +23,8 @@ A small floating window that stays on top. Drag it anywhere and it remembers its
 position. It shows what the camera sees and has:
 
 - **Stop / Resume** button
+- **–** button minimizes it to a small round bubble (green ring = active, amber = paused).
+  Click the bubble or flash four fingers twice to expand it; drag it to move it
 - Swipe mode: browser tabs (Ctrl+Tab) or windows (Alt+Tab)
 - Scroll speed, pause length, reverse scroll direction
 - Optional camera preview with the tracked hand points

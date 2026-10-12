@@ -6,6 +6,8 @@ Gestures
   * 3 fingers (index + middle + ring) swipe left/right -> previous / next tab
     (Ctrl+Shift+Tab / Ctrl+Tab, or Alt+Shift+Tab / Alt+Tab in "Windows" mode)
   * Open + close all 5 fingers twice                   -> stop / resume gestures
+  * Pinch index finger and thumb together once         -> stop / resume gestures
+  * Flash 4 fingers (thumb tucked) twice               -> expand the minimized window
 
 On Linux input is injected through /dev/uinput, so it works on KDE Wayland.
 On Windows it uses SendInput.
@@ -21,7 +23,7 @@ import mediapipe as mp
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python import vision
 from PyQt6.QtCore import QSettings, QThread, Qt, pyqtSignal, QPoint
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QHBoxLayout,
                              QLabel, QPushButton, QSlider, QVBoxLayout, QWidget)
 
@@ -40,7 +42,9 @@ SCROLL_STICKY = 0.5           # keep scrolling this long (s) if the 2-finger pos
 SWIPE_WINDOW = 0.45           # seconds of history used to detect a swipe
 SWIPE_DISTANCE = 0.16         # fraction of frame width hand must travel
 SWIPE_COOLDOWN = 0.8          # seconds between tab switches
-TOGGLE_WINDOW = 2.5           # seconds to complete open-close-open-close
+TOGGLE_WINDOW = 2.5           # seconds to complete open-close-open-close (or 4-finger flashes)
+PINCH_DISTANCE = 0.25         # thumb-index tip gap (fraction of palm size) that counts as a pinch
+PINCH_COOLDOWN = 0.6          # seconds before another pinch can toggle again
 
 
 # --- input injection ------------------------------------------------------
@@ -173,10 +177,22 @@ def fingers_up(lm):
     return up
 
 
+def _d3(a, b):
+    return ((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2) ** 0.5
+
+
 def classify(lm):
+    palm = _d(lm[0], lm[9])
+    # pinch: thumb and index tips touching, index reaching out (not curled into a fist)
+    if _d3(lm[4], lm[8]) < PINCH_DISTANCE * palm and _d(lm[8], lm[0]) > 0.9 * palm:
+        return "pinch"
     t, i, m, r, p = fingers_up(lm)
-    if i and m and r and p and t:
-        return "open"
+    if i and m and r and p:
+        tucked = (min(_d(lm[4], lm[9]), _d(lm[4], lm[13])) < 0.45 * palm
+                  or _d(lm[4], lm[5]) < 0.3 * palm)
+        if tucked:
+            return "four"
+        return "open" if t else "other"
     if not (i or m or r or p):
         return "fist"
     if i and m and r and not p:
@@ -270,6 +286,7 @@ class GestureWorker(QThread):
     event = pyqtSignal(str)           # last action performed
     paused_changed = pyqtSignal(bool)
     frame = pyqtSignal(QImage)
+    expand_requested = pyqtSignal()   # 4 fingers flashed twice
 
     def __init__(self, camera, injector):
         super().__init__()
@@ -311,6 +328,8 @@ class GestureWorker(QThread):
         swipe_hist = deque()
         last_swipe = 0.0
         toggle_events = deque()       # times of open->fist transitions
+        four_events = deque()         # times the 4-finger pose appeared
+        last_pinch = -PINCH_COOLDOWN
         prev_pose = None
         t0 = time.monotonic()
 
@@ -346,12 +365,25 @@ class GestureWorker(QThread):
             if pose != prev_pose:
                 if prev_pose == "open" and pose == "fist":
                     toggle_events.append(now)
+                if pose == "four":
+                    four_events.append(now)
+                # --- stop/resume: pinch once ------------------------------
+                if pose == "pinch" and now - last_pinch > PINCH_COOLDOWN:
+                    last_pinch = now
+                    self.set_paused(not self.paused)
                 prev_pose = pose
             while toggle_events and now - toggle_events[0] > TOGGLE_WINDOW:
                 toggle_events.popleft()
             if len(toggle_events) >= 2:
                 toggle_events.clear()
                 self.set_paused(not self.paused)
+
+            # --- expand the minimized window: 4 fingers flashed twice ------
+            while four_events and now - four_events[0] > TOGGLE_WINDOW:
+                four_events.popleft()
+            if len(four_events) >= 2:
+                four_events.clear()
+                self.expand_requested.emit()
 
             self.status.emit(("Paused · " if self.paused else "Active · ") + (pose or "…"))
             self._emit_preview(rgb, lm)
@@ -423,10 +455,68 @@ QLabel#event { color: #9aa0aa; }
 QPushButton { background: #2d6cdf; color: white; border: none; border-radius: 6px;
               padding: 6px 10px; font-weight: 600; }
 QPushButton#paused { background: #2e9e5b; }
-QPushButton#close { background: transparent; color: #9aa0aa; padding: 0 4px; font-size: 14px; }
+QPushButton#close, QPushButton#minimize { background: transparent; color: #9aa0aa;
+                                          padding: 0 4px; font-size: 14px; }
 QPushButton#close:hover { color: #ff6b6b; }
+QPushButton#minimize:hover { color: #ffffff; }
 QComboBox, QCheckBox { color: #e6e6e6; font-size: 11px; }
 """
+
+
+class MiniBubble(QWidget):
+    """Small round stand-in for the control window while it is minimized."""
+    SIZE = 52
+
+    def __init__(self, on_expand):
+        super().__init__(None, Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.WindowStaysOnTopHint
+                         | Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self.setToolTip("Hand Gestures: click or flash 4 fingers twice to expand")
+        self.on_expand = on_expand
+        self.paused = False
+        self._press = None
+        self._dragged = False
+
+    def set_paused(self, paused):
+        self.paused = paused
+        self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor("#e0a030" if self.paused else "#3ccf70"), 3))
+        p.setBrush(QColor("#1e1f24"))
+        p.drawEllipse(2, 2, self.SIZE - 4, self.SIZE - 4)
+        f = QFont()
+        f.setPointSize(16)
+        p.setFont(f)
+        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "✋")
+
+    # click expands, drag moves
+    def mousePressEvent(self, ev):
+        self._press = ev.globalPosition().toPoint()
+        self._offset = self._press - self.frameGeometry().topLeft()
+        self._dragged = False
+
+    def mouseMoveEvent(self, ev):
+        if self._press is None:
+            return
+        pos = ev.globalPosition().toPoint()
+        if not self._dragged and (pos - self._press).manhattanLength() > 5:
+            self._dragged = True
+            handle = self.windowHandle()
+            if handle and handle.startSystemMove():
+                self._press = None
+                return
+        if self._dragged:
+            self.move(pos - self._offset)
+
+    def mouseReleaseEvent(self, ev):
+        if self._press is not None and not self._dragged:
+            self.on_expand()
+        self._press = None
 
 
 class ControlWindow(QWidget):
@@ -452,12 +542,17 @@ class ControlWindow(QWidget):
         self.dot = QLabel("●")
         title = QLabel("Hand Gestures")
         title.setObjectName("title")
+        minimize = QPushButton("–")
+        minimize.setObjectName("minimize")
+        minimize.setToolTip("Minimize to a small bubble (flash 4 fingers twice to expand)")
+        minimize.clicked.connect(self.minimize)
         close = QPushButton("✕")
         close.setObjectName("close")
         close.clicked.connect(self.close)
         top.addWidget(self.dot)
         top.addWidget(title)
         top.addStretch()
+        top.addWidget(minimize)
         top.addWidget(close)
         lay.addLayout(top)
 
@@ -509,6 +604,8 @@ class ControlWindow(QWidget):
         worker.status.connect(self.status.setText)
         worker.event.connect(self.last.setText)
         worker.paused_changed.connect(self._paused_changed)
+        worker.expand_requested.connect(self.expand)
+        self.mini = MiniBubble(self.expand)
         worker.frame.connect(lambda img: self.preview.setPixmap(QPixmap.fromImage(img)))
 
         s = self.settings
@@ -549,7 +646,22 @@ class ControlWindow(QWidget):
         self.settings.setValue("preview", "true" if v else "false")
         self.adjustSize()
 
+    def minimize(self):
+        self.mini.move(self.pos())
+        self.hide()
+        self.mini.show()
+
+    def expand(self):
+        if not self.mini.isVisible():
+            return
+        self.move(self.mini.pos())
+        self.mini.hide()
+        self.show()
+        self.raise_()
+        self.last.setText("Expanded")
+
     def _paused_changed(self, paused):
+        self.mini.set_paused(paused)
         self.btn.setText("Resume gestures" if paused else "Stop gestures")
         self.btn.setObjectName("paused" if paused else "")
         self.btn.style().unpolish(self.btn)
