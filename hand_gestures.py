@@ -7,7 +7,7 @@ Gestures
     (Ctrl+Shift+Tab / Ctrl+Tab, or Alt+Shift+Tab / Alt+Tab in "Windows" mode)
   * Open + close all 5 fingers twice                   -> stop / resume gestures
   * Pinch index finger and thumb together once         -> stop / resume gestures
-  * Flash 4 fingers (thumb tucked) twice               -> expand the minimized window
+  * Flash 4 fingers (thumb tucked) twice               -> minimize / expand the window
 
 On Linux input is injected through /dev/uinput, so it works on KDE Wayland.
 On Windows it uses SendInput.
@@ -43,6 +43,7 @@ SWIPE_WINDOW = 0.45           # seconds of history used to detect a swipe
 SWIPE_DISTANCE = 0.16         # fraction of frame width hand must travel
 SWIPE_COOLDOWN = 0.8          # seconds between tab switches
 TOGGLE_WINDOW = 2.5           # seconds to complete open-close-open-close (or 4-finger flashes)
+THUMB_TUCKED = 0.65           # thumb tip within this many palm sizes of the palm centre = tucked
 PINCH_DISTANCE = 0.25         # thumb-index tip gap (fraction of palm size) that counts as a pinch
 PINCH_COOLDOWN = 0.6          # seconds before another pinch can toggle again
 
@@ -186,13 +187,12 @@ def classify(lm):
     # pinch: thumb and index tips touching, index reaching out (not curled into a fist)
     if _d3(lm[4], lm[8]) < PINCH_DISTANCE * palm and _d(lm[8], lm[0]) > 0.9 * palm:
         return "pinch"
-    t, i, m, r, p = fingers_up(lm)
+    _, i, m, r, p = fingers_up(lm)
     if i and m and r and p:
-        tucked = (min(_d(lm[4], lm[9]), _d(lm[4], lm[13])) < 0.45 * palm
-                  or _d(lm[4], lm[5]) < 0.3 * palm)
-        if tucked:
-            return "four"
-        return "open" if t else "other"
+        # measured: tucked thumb sits ~0.2 palm sizes from the palm centre, spread ~0.9
+        centre = [sum(c) / 5 for c in zip(*((lm[k].x, lm[k].y) for k in (0, 5, 9, 13, 17)))]
+        thumb_gap = ((lm[4].x - centre[0]) ** 2 + (lm[4].y - centre[1]) ** 2) ** 0.5
+        return "four" if thumb_gap < THUMB_TUCKED * palm else "open"
     if not (i or m or r or p):
         return "fist"
     if i and m and r and not p:
@@ -286,7 +286,7 @@ class GestureWorker(QThread):
     event = pyqtSignal(str)           # last action performed
     paused_changed = pyqtSignal(bool)
     frame = pyqtSignal(QImage)
-    expand_requested = pyqtSignal()   # 4 fingers flashed twice
+    minimize_toggled = pyqtSignal()   # 4 fingers flashed twice
 
     def __init__(self, camera, injector):
         super().__init__()
@@ -378,12 +378,12 @@ class GestureWorker(QThread):
                 toggle_events.clear()
                 self.set_paused(not self.paused)
 
-            # --- expand the minimized window: 4 fingers flashed twice ------
+            # --- minimize / expand the window: 4 fingers flashed twice ----
             while four_events and now - four_events[0] > TOGGLE_WINDOW:
                 four_events.popleft()
             if len(four_events) >= 2:
                 four_events.clear()
-                self.expand_requested.emit()
+                self.minimize_toggled.emit()
 
             self.status.emit(("Paused · " if self.paused else "Active · ") + (pose or "…"))
             self._emit_preview(rgb, lm)
@@ -544,7 +544,7 @@ class ControlWindow(QWidget):
         title.setObjectName("title")
         minimize = QPushButton("–")
         minimize.setObjectName("minimize")
-        minimize.setToolTip("Minimize to a small bubble (flash 4 fingers twice to expand)")
+        minimize.setToolTip("Minimize to a small bubble (or flash 4 fingers twice)")
         minimize.clicked.connect(self.minimize)
         close = QPushButton("✕")
         close.setObjectName("close")
@@ -604,7 +604,8 @@ class ControlWindow(QWidget):
         worker.status.connect(self.status.setText)
         worker.event.connect(self.last.setText)
         worker.paused_changed.connect(self._paused_changed)
-        worker.expand_requested.connect(self.expand)
+        worker.minimize_toggled.connect(
+            lambda: self.expand() if self.mini.isVisible() else self.minimize())
         self.mini = MiniBubble(self.expand)
         worker.frame.connect(lambda img: self.preview.setPixmap(QPixmap.fromImage(img)))
 
