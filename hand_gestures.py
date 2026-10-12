@@ -47,7 +47,8 @@ REVERSE_RATIO = 1.2           # scrolling the other way needs this many times th
 STILL_RANGE = 0.015           # movement range (frame height) that still counts as "still"
 STILL_WINDOW = 0.2            # seconds used to judge stillness
 SETTLE_TIME = 0.1             # hand must be still this long (s) before the first scroll
-SCROLL_HOLD = 1.5             # keep following the fingertips this long (s) after 2 fingers were last seen
+SCROLL_HOLD = 0.8             # keep following the fingertips this long (s) after 2 fingers were last seen
+SCROLL_ENTRY_HOLD = 0.4       # a deliberate 2-finger pose must be held this long (s) to start scrolling
 HAND_LOST_RESET = 0.6         # forget the scroll stroke if the hand is missing this long (s)
 SWIPE_WINDOW = 0.45           # seconds of history used to detect a swipe
 SWIPE_DISTANCE = 0.16         # fraction of frame width hand must travel
@@ -56,7 +57,10 @@ TOGGLE_WINDOW = 2.5           # seconds to complete open-close-open-close (or 4-
 THUMB_TUCKED = 0.65           # thumb tip within this many palm sizes of the palm centre = tucked
 PINCH_DISTANCE = 0.25         # thumb-index tip gap (fraction of palm size) that counts as a pinch
 PINCH_COOLDOWN = 0.6          # seconds before another pinch can toggle again
+PINCH_HOLD = 0.2              # pinch must be held this long (s), so passing fingers don't trigger it
 TWO_FINGER_UP = 1.0           # index/middle tip-to-wrist vs knuckle-to-wrist ratio for "two"
+STRICT_TWO_UP = 1.12          # ...and the stricter ratio needed to *start* scrolling (measured 1.15-1.47)
+STRICT_RING_DOWN = 1.0        # ring finger ratio must be below this to start (measured 0.73-1.09)
                               # (looser than 1.1: they bend a little while flicking)
 
 
@@ -194,6 +198,20 @@ def fingers_up(lm):
 
 def _d3(a, b):
     return ((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2) ** 0.5
+
+
+def strict_two(lm):
+    """A deliberate 2-finger pose: index and middle clearly straight and pointing
+    roughly upward, ring finger folded. Required to *start* scrolling, so that
+    relaxed or random finger movements don't."""
+    wrist = lm[0]
+    ratio = lambda tip, pip: _d(lm[tip], wrist) / max(_d(lm[pip], wrist), 1e-6)
+    if not (ratio(8, 6) > STRICT_TWO_UP and ratio(12, 10) > STRICT_TWO_UP
+            and ratio(16, 14) < STRICT_RING_DOWN):
+        return False
+    # index knuckle -> tip within ~60 degrees of straight up
+    dx, dy = lm[8].x - lm[5].x, lm[8].y - lm[5].y
+    return -dy > 0.5 * (dx * dx + dy * dy) ** 0.5
 
 
 def classify(lm):
@@ -379,8 +397,12 @@ class GestureWorker(QThread):
 
         raw_pose, raw_count, pose = None, 0, None
         last_two = -1e9               # last time the 2-finger pose was seen
+        strict_since = None           # start of the current deliberate 2-finger hold
+        strict_last = -1e9            # last frame the deliberate pose was seen
+        scroll_active = False
         last_hand = -1e9
         pinch_armed = True
+        pinch_since = None
         swipe_hist = deque()
         last_swipe = 0.0
         toggle_events = deque()       # times of open->fist transitions
@@ -404,6 +426,7 @@ class GestureWorker(QThread):
 
             if not res.hand_landmarks:
                 raw_pose, raw_count, pose = None, 0, None
+                strict_since = None
                 if now - last_hand > HAND_LOST_RESET:
                     self.scroll.reset()
                 swipe_hist.clear()
@@ -419,18 +442,30 @@ class GestureWorker(QThread):
             if raw_count >= POSE_STABLE_FRAMES:
                 pose = p
 
-            # Scroll mode: entered with a steady 2-finger pose, then the fingertips are
-            # followed whatever the pose reads mid-motion (bent fingers look like a fist or
-            # a pinch), until 2 fingers haven't been seen for SCROLL_HOLD or 3/4 fingers show.
-            if pose == "two" or (p == "two" and now - last_two < SCROLL_HOLD):
+            # Scroll mode: started by holding a deliberate 2-finger pose for
+            # SCROLL_ENTRY_HOLD, then the fingertips are followed whatever the pose reads
+            # mid-motion (bent fingers look like a fist or a pinch), until 2 fingers
+            # haven't been seen for SCROLL_HOLD or 3/4 fingers show.
+            if strict_two(lm):          # a single odd frame (<0.15 s) doesn't break the hold
+                if strict_since is None or now - strict_last > 0.15:
+                    strict_since = now
+                strict_last = now
+            if not scroll_active and strict_since is not None and strict_last == now \
+                    and now - strict_since >= SCROLL_ENTRY_HOLD and not self.paused:
+                scroll_active, last_two = True, now
+                self.scroll.reset()
+                self.event.emit("Scroll mode ✌")
+            if scroll_active and p == "two":
                 last_two = now
-            if pose in ("three", "four"):
-                last_two = -1e9
-            scrolling = not self.paused and now - last_two < SCROLL_HOLD
+            if pose in ("three", "four") or now - last_two >= SCROLL_HOLD or self.paused:
+                scroll_active = False
+            scrolling = scroll_active
 
             # --- pause / window gestures (ignored while scrolling) ----------
             if pose != "pinch":
-                pinch_armed = True
+                pinch_armed, pinch_since = True, None
+            elif pinch_since is None:
+                pinch_since = now
             if scrolling:
                 toggle_events.clear()
                 four_events.clear()
@@ -443,7 +478,7 @@ class GestureWorker(QThread):
                 prev_pose = pose
             # --- play/pause media: pinch once ---------------------------
             if (not scrolling and not self.paused and pose == "pinch" and pinch_armed
-                    and now - last_pinch > PINCH_COOLDOWN):
+                    and now - pinch_since >= PINCH_HOLD and now - last_pinch > PINCH_COOLDOWN):
                 pinch_armed = False
                 last_pinch = now
                 self.inj.combo("playpause")

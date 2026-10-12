@@ -8,7 +8,7 @@ CachyOS / KDE Plasma) and **Windows 10/11**.
 
 | Gesture | Action |
 |---|---|
-| ✌️ Index + middle finger up, wave up / down | Scroll. Bigger waves scroll more; small finger flicks scroll a little |
+| ✌️ Hold index + middle finger up for a moment, then wave up / down | Scroll. Bigger waves scroll more; small finger flicks scroll a little |
 | 🤟 Index + middle + ring finger up, swipe right / left | Next / previous tab (Ctrl+Tab), or window (Alt+Tab) |
 | 👌 Pinch index finger and thumb together once | Play / pause videos and music (media ⏯ key) |
 | 🖐️✊🖐️✊ Open and close all five fingers twice | Stop / resume gestures |
