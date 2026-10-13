@@ -16,6 +16,7 @@ import argparse
 import math
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -43,7 +44,8 @@ SCROLL_SMOOTH_TAU = 0.04      # seconds; fingertip position smoothing time const
 FLICK_MIN_SPEED = 0.25        # slower movements never scroll (drift, slow returns)
 FIRST_FLICK_SPEED = 0.6       # with no scroll direction yet, a flick this fast scrolls
 FIRST_FLICK_RATIO = 1.3       # ...or one this many times faster than the movement before it
-REVERSE_RATIO = 1.2           # scrolling the other way needs this many times the last flick's speed
+MAX_MOVE_SCROLL = 0.6         # most one movement can scroll (frame heights, ~30 notches at default speed)
+SCROLL_CONFIRM = 0.12         # seconds a scroll is held back; dropped if the hand leaves the frame meanwhile
 STILL_RANGE = 0.015           # movement range (frame height) that still counts as "still"
 STILL_WINDOW = 0.2            # seconds used to judge stillness
 SETTLE_TIME = 0.1             # hand must be still this long (s) before the first scroll
@@ -76,7 +78,7 @@ class LinuxInjector:
         self.e = e
         self.keys = {"ctrl": e.KEY_LEFTCTRL, "shift": e.KEY_LEFTSHIFT,
                      "alt": e.KEY_LEFTALT, "tab": e.KEY_TAB,
-                     "playpause": e.KEY_PLAYPAUSE}
+                     "playpause": e.KEY_PLAYPAUSE, "space": e.KEY_SPACE}
         self.kbd = UInput({e.EV_KEY: list(range(1, 249))}, name="hand-gestures-kbd")
         self.mouse = UInput({
             e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
@@ -144,7 +146,8 @@ class WindowsInjector:
 
         self.INPUT, self.MOUSEINPUT, self.KEYBDINPUT = INPUT, MOUSEINPUT, KEYBDINPUT
         self.keys = {"ctrl": 0x11, "shift": 0x10, "alt": 0x12, "tab": 0x09,
-                     "playpause": 0xB3}  # VK_MEDIA_PLAY_PAUSE
+                     "playpause": 0xB3,  # VK_MEDIA_PLAY_PAUSE
+                     "space": 0x20}
         self._acc = 0.0
 
     def _send(self, inp):
@@ -263,12 +266,13 @@ class ScrollTracker:
       * with no scroll direction yet, a movement scrolls if it is a clear flick
         (FIRST_FLICK_SPEED, or FIRST_FLICK_RATIO x faster than the movement before);
       * after that, movements in the same direction scroll if they beat
-        FLICK_MIN_SPEED, and movements the other way are returns that never scroll,
-        unless they are REVERSE_RATIO x faster than the last scrolling flick;
+        FLICK_MIN_SPEED, and movements the other way are returns that never scroll
+        (however fast: dropping the hand at the end is fast too);
       * resting for `pause` seconds forgets the direction.
     Nothing scrolls until the hand has been still once after the tracker starts, so
     raising the hand into position (or joining mid-wave) doesn't scroll.
-    A scrolling movement scrolls its whole length, accelerated by its size.
+    A scrolling movement scrolls its whole length, accelerated by its size, up to
+    MAX_MOVE_SCROLL. `move_id` changes with every movement (for one-step scrolling).
     """
 
     def __init__(self):
@@ -285,11 +289,12 @@ class ScrollTracker:
         self.scrolled_to = 0.0        # position up to which it has scrolled
         self.prev_peak = 0.0          # peak speed of the previous movement
         self.pref = 0                 # scroll direction learned from the last flick
-        self.pref_peak = 0.0          # that flick's peak speed
         self.hist = deque()
         self.still_since = None
         self.settled = False          # hand has been still since the tracker started
         self.move_settled = False     # current movement began after settling
+        self.move_scrolled = 0.0      # how much the current movement has scrolled
+        self.move_id = getattr(self, "move_id", 0) + 1
 
     def update(self, t, y):
         """y: normalized fingertip height (0 = top). Returns scroll in frame heights, + = up."""
@@ -323,6 +328,7 @@ class ScrollTracker:
                 self.dir = 1 if p > self.start else -1
                 self.extreme, self.peak = p, speed
                 self.move_settled = self.settled
+                self.move_id += 1
             return 0.0
         if (p - self.extreme) * self.dir >= 0:      # still moving the same way
             self.extreme = p
@@ -333,16 +339,18 @@ class ScrollTracker:
             self.dir, self.start, self.extreme = -self.dir, self.extreme, p
             self.peak, self.scrolling = speed, False
             self.move_settled = self.settled
+            self.move_id += 1
 
         if not self.scrolling and self._qualifies(p):
-            self.scrolling, self.scrolled_to = True, self.start
+            self.scrolling, self.scrolled_to, self.move_scrolled = True, self.start, 0.0
             self.pref = self.dir
-        if self.scrolling:
-            self.pref_peak = max(self.pref_peak, self.peak) if self.pref == self.dir else self.peak
-            if (p - self.scrolled_to) * self.dir > 0:
-                delta = p - self.scrolled_to
-                self.scrolled_to = p
-                return delta * (1 + SCROLL_ACCEL * abs(p - self.start))
+        if self.scrolling and (p - self.scrolled_to) * self.dir > 0:
+            delta = p - self.scrolled_to
+            self.scrolled_to = p
+            amount = abs(delta) * (1 + SCROLL_ACCEL * abs(p - self.start))
+            amount = min(amount, MAX_MOVE_SCROLL - self.move_scrolled)
+            self.move_scrolled += amount
+            return amount * self.dir
         return 0.0
 
     def _qualifies(self, p):
@@ -352,11 +360,31 @@ class ScrollTracker:
         if self.pref == self.dir:
             return True
         if self.pref == -self.dir:
-            return self.peak > REVERSE_RATIO * self.pref_peak
+            return False              # a return; rest for `pause` to change direction
         # no direction yet: a clear flick, or clearly faster than the movement before
         # (the very first movement has nothing to compare with)
         return (self.peak > FIRST_FLICK_SPEED
                 or self.prev_peak > 0 and self.peak > FIRST_FLICK_RATIO * self.prev_peak)
+
+
+# --- media players ----------------------------------------------------------
+def media_states():
+    """Playback status of every MPRIS media player on Linux, or None if unknown."""
+    if IS_WINDOWS:
+        return None
+    try:
+        out = subprocess.run(["busctl", "--user", "list"], capture_output=True,
+                             text=True, timeout=1).stdout
+        states = {}
+        for name in sorted({l.split()[0] for l in out.splitlines()
+                            if l.startswith("org.mpris.MediaPlayer2.")}):
+            r = subprocess.run(["busctl", "--user", "get-property", name, "/org/mpris/MediaPlayer2",
+                                "org.mpris.MediaPlayer2.Player", "PlaybackStatus"],
+                               capture_output=True, text=True, timeout=1)
+            states[name] = r.stdout.strip()
+        return states
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 # --- worker thread ----------------------------------------------------------
@@ -376,6 +404,8 @@ class GestureWorker(QThread):
         self.mode = "tabs"            # "tabs" or "windows"
         self.reverse_scroll = False
         self.scroll_speed = 6000      # hi-res units per full frame height
+        self.scroll_style = "smooth"  # "smooth", or "step": one wheel notch per flick (Shorts, Reels)
+        self.pinch_action = "auto"    # "auto", "media" (play/pause key) or "space"
         self.scroll = ScrollTracker()
         self.preview = False
 
@@ -424,6 +454,8 @@ class GestureWorker(QThread):
         toggle_events = deque()       # times of open->fist transitions
         four_events = deque()         # times the 4-finger pose appeared
         last_pinch = -PINCH_COOLDOWN
+        pending = deque()             # scrolls held back for SCROLL_CONFIRM: (time, amount, move id)
+        last_step_move = None
         prev_pose = None
         t0 = time.monotonic()
 
@@ -443,6 +475,7 @@ class GestureWorker(QThread):
             if not res.hand_landmarks:
                 raw_pose, raw_count, pose = None, 0, None
                 strict_since = None
+                pending.clear()       # the hand left the frame: that was no flick
                 if now - last_hand > HAND_LOST_RESET:
                     self.scroll.reset()
                 swipe_hist.clear()
@@ -497,8 +530,7 @@ class GestureWorker(QThread):
                     and now - pinch_since >= PINCH_HOLD and now - last_pinch > PINCH_COOLDOWN):
                 pinch_armed = False
                 last_pinch = now
-                self.inj.combo("playpause")
-                self.event.emit("Play / Pause ⏯")
+                threading.Thread(target=self._play_pause, daemon=True).start()
             # --- stop/resume: open-close twice ----------------------------
             while toggle_events and now - toggle_events[0] > TOGGLE_WINDOW:
                 toggle_events.popleft()
@@ -524,11 +556,20 @@ class GestureWorker(QThread):
             if scrolling:
                 amount = self.scroll.update(now, (lm[8].y + lm[12].y) / 2)
                 if amount:
-                    if self.reverse_scroll:
-                        amount = -amount
-                    self.inj.scroll(amount * self.scroll_speed)
+                    pending.append((now, -amount if self.reverse_scroll else amount,
+                                    self.scroll.move_id))
             else:
                 self.scroll.reset()
+                pending.clear()
+            while pending and now - pending[0][0] >= SCROLL_CONFIRM:
+                _, amount, move = pending.popleft()
+                if self.scroll_style == "step":
+                    if move != last_step_move:        # one notch per flick
+                        last_step_move = move
+                        self.inj.scroll(120 if amount > 0 else -120)
+                        self.event.emit("Previous ↑" if amount > 0 else "Next ↓")
+                else:
+                    self.inj.scroll(amount * self.scroll_speed)
 
             # --- swipe: three fingers -------------------------------------
             if pose == "three":
@@ -546,6 +587,23 @@ class GestureWorker(QThread):
 
         cap.release()
         landmarker.close()
+
+    def _play_pause(self):
+        """Pinch action. In auto mode, send the media play/pause key; if no media
+        player reacts (many streaming sites don't register one), press Space."""
+        if self.pinch_action == "space":
+            self.inj.combo("space")
+            self.event.emit("Play / Pause (Space)")
+            return
+        before = None if self.pinch_action == "media" else media_states()
+        self.inj.combo("playpause")
+        if before is not None:
+            time.sleep(0.4)
+            if media_states() == before:
+                self.inj.combo("space")
+                self.event.emit("Play / Pause (Space)")
+                return
+        self.event.emit("Play / Pause ⏯")
 
     def _switch(self, right):
         mod = "alt" if self.mode == "windows" else "ctrl"
@@ -697,6 +755,20 @@ class ControlWindow(QWidget):
         self.mode.currentIndexChanged.connect(self._mode_changed)
         lay.addWidget(self.mode)
 
+        self.style_box = QComboBox()
+        self.style_box.addItems(["Scroll: smooth (pages, documents)",
+                                 "Scroll: one step per flick (Shorts, Reels)"])
+        self.style_box.currentIndexChanged.connect(self._style_changed)
+        lay.addWidget(self.style_box)
+
+        self.pinch_box = QComboBox()
+        self.pinch_box.addItems(["Pinch: play/pause (auto)", "Pinch: media key only",
+                                 "Pinch: Space key only"])
+        self.pinch_box.setToolTip("Auto sends the media play/pause key, and presses Space\n"
+                                  "if no media player reacted (e.g. some streaming sites)")
+        self.pinch_box.currentIndexChanged.connect(self._pinch_changed)
+        lay.addWidget(self.pinch_box)
+
         speed_row = QHBoxLayout()
         speed_row.addWidget(QLabel("Scroll speed"))
         self.speed = QSlider(Qt.Orientation.Horizontal)
@@ -743,6 +815,10 @@ class ControlWindow(QWidget):
         self.reverse.setChecked(s.value("reverse", "false") == "true")
         self.preview_cb.setChecked(s.value("preview", "false") == "true")
         self._mode_changed(self.mode.currentIndex())
+        self.style_box.setCurrentIndex(int(s.value("scroll_style", 0)))
+        self._style_changed(self.style_box.currentIndex())
+        self.pinch_box.setCurrentIndex(int(s.value("pinch_action", 0)))
+        self._pinch_changed(self.pinch_box.currentIndex())
         self._speed_changed(self.speed.value())
         self._paused_changed(False)
         self.setFixedWidth(250)
@@ -750,6 +826,14 @@ class ControlWindow(QWidget):
             self.move(s.value("pos", type=QPoint))
 
     # settings handlers
+    def _style_changed(self, i):
+        self.worker.scroll_style = "step" if i == 1 else "smooth"
+        self.settings.setValue("scroll_style", i)
+
+    def _pinch_changed(self, i):
+        self.worker.pinch_action = ("auto", "media", "space")[i]
+        self.settings.setValue("pinch_action", i)
+
     def _mode_changed(self, i):
         self.worker.mode = "windows" if i == 1 else "tabs"
         self.settings.setValue("mode", i)

@@ -10,7 +10,7 @@ CachyOS / KDE Plasma) and **Windows 10/11**.
 |---|---|
 | ✌️ Hold index + middle finger out (ring finger folded) for a moment, then wave up / down. Works upright, tilted, or pointing at the screen | Scroll. Bigger waves scroll more; small finger flicks scroll a little |
 | 🤟 Index + middle + ring finger up, swipe right / left | Next / previous tab (Ctrl+Tab), or window (Alt+Tab) |
-| 👌 Pinch index finger and thumb together once | Play / pause videos and music (media ⏯ key) |
+| 👌 Pinch index finger and thumb together briefly | Play / pause videos and music |
 | 🖐️✊🖐️✊ Open and close all five fingers twice | Stop / resume gestures |
 | Flash four fingers (thumb tucked in) twice | Minimize to the bubble, or expand it back |
 
@@ -31,6 +31,10 @@ position. It shows what the camera sees and has:
 - **–** button minimizes it to a small round bubble (green ring = active, amber = paused).
   Click the bubble or flash four fingers twice to expand it again; drag it to move it
 - Swipe mode: browser tabs (Ctrl+Tab) or windows (Alt+Tab)
+- Scroll style: smooth (pages, documents) or **one step per flick** (YouTube Shorts,
+  Reels, TikTok: each flick moves exactly one video)
+- Pinch: **auto** sends the media play/pause key and, if no media player reacts (some
+  streaming sites don't register one), presses Space instead; or force either key
 - Scroll speed, return lock, reverse scroll direction
 - Optional camera preview with the tracked hand points
 
