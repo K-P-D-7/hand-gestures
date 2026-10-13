@@ -48,7 +48,7 @@ STILL_RANGE = 0.015           # movement range (frame height) that still counts 
 STILL_WINDOW = 0.2            # seconds used to judge stillness
 SETTLE_TIME = 0.1             # hand must be still this long (s) before the first scroll
 SCROLL_HOLD = 0.8             # keep following the fingertips this long (s) after 2 fingers were last seen
-SCROLL_ENTRY_HOLD = 0.4       # a deliberate 2-finger pose must be held this long (s) to start scrolling
+SCROLL_ENTRY_HOLD = 0.5       # a deliberate 2-finger pose must be held this long (s) to start scrolling
 HAND_LOST_RESET = 0.6         # forget the scroll stroke if the hand is missing this long (s)
 SWIPE_WINDOW = 0.45           # seconds of history used to detect a swipe
 SWIPE_DISTANCE = 0.16         # fraction of frame width hand must travel
@@ -58,9 +58,14 @@ THUMB_TUCKED = 0.65           # thumb tip within this many palm sizes of the pal
 PINCH_DISTANCE = 0.25         # thumb-index tip gap (fraction of palm size) that counts as a pinch
 PINCH_COOLDOWN = 0.6          # seconds before another pinch can toggle again
 PINCH_HOLD = 0.2              # pinch must be held this long (s), so passing fingers don't trigger it
-TWO_FINGER_UP = 1.0           # index/middle tip-to-wrist vs knuckle-to-wrist ratio for "two"
-STRICT_TWO_UP = 1.12          # ...and the stricter ratio needed to *start* scrolling (measured 1.15-1.47)
-STRICT_RING_DOWN = 1.0        # ring finger ratio must be below this to start (measured 0.73-1.09)
+# 2-finger pose, as finger bend in degrees (knuckle + middle joint, 0 = straight).
+# Measured on a real hand held upright, tilted sideways and pointing at the screen:
+# the ring finger is folded 100-185 deg and 25-135 deg more than index/middle, while
+# random finger movement stays within ~50 deg. (start = strict, keep going = loose)
+TWO_RING_BEND = (80, 60)      # ring finger bent at least this much
+TWO_RING_MARGIN = (20, 10)    # ...and this much more than index and middle
+TWO_INDEX_MAX = (70, 90)      # index bent at most this much
+TWO_MIDDLE_MAX = (130, 140)   # middle bent at most this much (looks bent when pointing at the camera)
                               # (looser than 1.1: they bend a little while flicking)
 
 
@@ -200,18 +205,32 @@ def _d3(a, b):
     return ((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2) ** 0.5
 
 
+def _angle(a, b, c):
+    """Angle at b in degrees, in 3D."""
+    v1 = (a.x - b.x, a.y - b.y, a.z - b.z)
+    v2 = (c.x - b.x, c.y - b.y, c.z - b.z)
+    n = math.hypot(*v1) * math.hypot(*v2)
+    cos = sum(x * y for x, y in zip(v1, v2)) / n if n else 1.0
+    return math.degrees(math.acos(max(-1.0, min(1.0, cos))))
+
+
+def _bend(lm, mcp, pip, dip):
+    """How bent a finger is at its knuckle and middle joint (0 = straight). Angles
+    hold up when the hand is tilted or points at the camera; lengths don't."""
+    return (180 - _angle(lm[0], lm[mcp], lm[pip])) + (180 - _angle(lm[mcp], lm[pip], lm[dip]))
+
+
+def _is_two(lm, strict):
+    k = 0 if strict else 1
+    i, m, r = _bend(lm, 5, 6, 7), _bend(lm, 9, 10, 11), _bend(lm, 13, 14, 15)
+    return (r >= TWO_RING_BEND[k] and r - max(i, m) >= TWO_RING_MARGIN[k]
+            and i <= TWO_INDEX_MAX[k] and m <= TWO_MIDDLE_MAX[k])
+
+
 def strict_two(lm):
-    """A deliberate 2-finger pose: index and middle clearly straight and pointing
-    roughly upward, ring finger folded. Required to *start* scrolling, so that
-    relaxed or random finger movements don't."""
-    wrist = lm[0]
-    ratio = lambda tip, pip: _d(lm[tip], wrist) / max(_d(lm[pip], wrist), 1e-6)
-    if not (ratio(8, 6) > STRICT_TWO_UP and ratio(12, 10) > STRICT_TWO_UP
-            and ratio(16, 14) < STRICT_RING_DOWN):
-        return False
-    # index knuckle -> tip within ~60 degrees of straight up
-    dx, dy = lm[8].x - lm[5].x, lm[8].y - lm[5].y
-    return -dy > 0.5 * (dx * dx + dy * dy) ** 0.5
+    """A deliberate 2-finger pose (index + middle out, ring folded), held upright,
+    tilted or pointing at the screen. Required to *start* scrolling."""
+    return _is_two(lm, strict=True)
 
 
 def classify(lm):
@@ -219,6 +238,9 @@ def classify(lm):
     # pinch: thumb and index tips touching, index reaching out (not curled into a fist)
     if _d3(lm[4], lm[8]) < PINCH_DISTANCE * palm and _d(lm[8], lm[0]) > 0.9 * palm:
         return "pinch"
+    # two: index + middle out, ring folded; the pinky is ignored (often loosely curled)
+    if _is_two(lm, strict=False):
+        return "two"
     _, i, m, r, p = fingers_up(lm)
     if i and m and r and p:
         # measured: tucked thumb sits ~0.2 palm sizes from the palm centre, spread ~0.9
@@ -229,12 +251,6 @@ def classify(lm):
         return "fist"
     if i and m and r and not p:
         return "three"
-    # two: index + middle up, ring folded. The pinky is ignored: a loosely curled
-    # pinky measured as "up" in about half the frames of a real scrolling hand.
-    wrist = lm[0]
-    straight = lambda tip, pip: _d(lm[tip], wrist) > _d(lm[pip], wrist) * TWO_FINGER_UP
-    if straight(8, 6) and straight(12, 10) and not r:
-        return "two"
     return "other"
 
 
