@@ -8,6 +8,7 @@ Gestures
   * Open + close all 5 fingers twice                   -> stop / resume gestures
   * Pinch index finger and thumb together once         -> play / pause media (videos, music)
   * Flash 4 fingers (thumb tucked) twice               -> minimize / expand the window
+  * Cross both index fingers into an X and hold        -> close the app
 
 On Linux input is injected through /dev/uinput, so it works on KDE Wayland.
 On Windows it uses SendInput.
@@ -60,6 +61,8 @@ THUMB_TUCKED = 0.65           # thumb tip within this many palm sizes of the pal
 PINCH_DISTANCE = 0.25         # thumb-index tip gap (fraction of palm size) that counts as a pinch
 PINCH_COOLDOWN = 0.6          # seconds before another pinch can toggle again
 PINCH_HOLD = 0.2              # pinch must be held this long (s), so passing fingers don't trigger it
+CROSS_HOLD = 0.6              # index fingers crossed (X) this long (s) closes the app
+CROSS_INDEX_MAX_BEND = 60     # each index finger must be roughly straight (degrees of bend)
 # 2-finger pose, as finger bend in degrees (knuckle + middle joint, 0 = straight).
 # Measured on a real hand held upright, tilted sideways and pointing at the screen:
 # the ring finger is folded 100-185 deg and 25-135 deg more than index/middle, while
@@ -230,6 +233,27 @@ def _is_two(lm, strict):
             and i <= TWO_INDEX_MAX[k] and m <= TWO_MIDDLE_MAX[k])
 
 
+def _segments_cross(a1, a2, b1, b2):
+    """True if 2D segments a1-a2 and b1-b2 intersect."""
+    def side(p, q, r):
+        return (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x)
+    return (side(a1, a2, b1) * side(a1, a2, b2) < 0
+            and side(b1, b2, a1) * side(b1, b2, a2) < 0)
+
+
+def crossed_index_fingers(h1, h2):
+    """Two hands with straight index fingers crossing each other in an X."""
+    if _bend(h1, 5, 6, 7) > CROSS_INDEX_MAX_BEND or _bend(h2, 5, 6, 7) > CROSS_INDEX_MAX_BEND:
+        return False
+    if not _segments_cross(h1[5], h1[8], h2[5], h2[8]):
+        return False
+    # an X, not two fingers lying along each other: 35-145 degrees apart
+    v1 = (h1[8].x - h1[5].x, h1[8].y - h1[5].y)
+    v2 = (h2[8].x - h2[5].x, h2[8].y - h2[5].y)
+    cos = abs(v1[0] * v2[0] + v1[1] * v2[1]) / (math.hypot(*v1) * math.hypot(*v2) or 1)
+    return cos < math.cos(math.radians(35))
+
+
 def strict_two(lm):
     """A deliberate 2-finger pose (index + middle out, ring folded), held upright,
     tilted or pointing at the screen. Required to *start* scrolling."""
@@ -394,6 +418,7 @@ class GestureWorker(QThread):
     paused_changed = pyqtSignal(bool)
     frame = pyqtSignal(QImage)
     minimize_toggled = pyqtSignal()   # 4 fingers flashed twice
+    quit_requested = pyqtSignal()     # index fingers crossed
 
     def __init__(self, camera, injector):
         super().__init__()
@@ -435,7 +460,7 @@ class GestureWorker(QThread):
             vision.HandLandmarkerOptions(
                 base_options=BaseOptions(model_asset_path=str(MODEL)),
                 running_mode=vision.RunningMode.VIDEO,
-                num_hands=1,
+                num_hands=2,
                 min_hand_detection_confidence=0.6,
                 min_hand_presence_confidence=0.6,
                 min_tracking_confidence=0.5,
@@ -457,6 +482,8 @@ class GestureWorker(QThread):
         pending = deque()             # scrolls held back for SCROLL_CONFIRM: (time, amount, move id)
         last_step_move = None
         prev_pose = None
+        cross_since = None
+        main_wrist = None             # follow the same hand when two are in view
         t0 = time.monotonic()
 
         while self.running:
@@ -483,7 +510,26 @@ class GestureWorker(QThread):
                 self._emit_preview(rgb, None)
                 continue
 
-            lm = res.hand_landmarks[0]
+            hands = res.hand_landmarks
+            # --- close the app: index fingers crossed in an X, held -------------
+            if len(hands) >= 2 and crossed_index_fingers(hands[0], hands[1]):
+                cross_since = cross_since or now
+                held = now - cross_since
+                self.status.emit("✕ Hold to close…" if held < CROSS_HOLD else "Closing")
+                if held >= CROSS_HOLD:
+                    self.event.emit("Closing ✕")
+                    self.quit_requested.emit()
+                    self.running = False
+                self._emit_preview(rgb, hands[0])
+                pending.clear()
+                continue
+            cross_since = None
+            # the other gestures use one hand: the one nearest to where it was last frame
+            if len(hands) >= 2 and main_wrist is not None:
+                hands = sorted(hands, key=lambda h: (h[0].x - main_wrist[0]) ** 2
+                               + (h[0].y - main_wrist[1]) ** 2)
+            lm = hands[0]
+            main_wrist = (lm[0].x, lm[0].y)
             last_hand = now
             p = classify(lm)
             raw_count = raw_count + 1 if p == raw_pose else 1
@@ -802,6 +848,7 @@ class ControlWindow(QWidget):
         worker.status.connect(self.status.setText)
         worker.event.connect(self.last.setText)
         worker.paused_changed.connect(self._paused_changed)
+        worker.quit_requested.connect(self.close)
         worker.minimize_toggled.connect(
             lambda: self.expand() if self.mini.isVisible() else self.minimize())
         self.mini = MiniBubble(self.expand)

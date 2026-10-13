@@ -13,6 +13,7 @@ CachyOS / KDE Plasma) and **Windows 10/11**.
 | 👌 Pinch index finger and thumb together briefly | Play / pause videos and music |
 | 🖐️✊🖐️✊ Open and close all five fingers twice | Stop / resume gestures |
 | Flash four fingers (thumb tucked in) twice | Minimize to the bubble, or expand it back |
+| ✕ Cross your two index fingers into an X and hold for a moment | Close the app |
 
 Scrolling follows how you naturally flick: the flick is fast and bringing your hand
 back is slower, so only the flick scrolls. Once you've scrolled one way, keep flicking
